@@ -1,3 +1,15 @@
+# ⛽ FuelCast
+
+**AI-Powered Predictive Analytics for Fuel Price Forecasting**
+
+FuelCast is a state-of-the-art dashboard that leverages hybrid machine learning models (SARIMAX + XGBoost) to forecast US gasoline prices. It provides real-time insights, model performance metrics, and explainable AI features to help stakeholders make data-driven decisions.
+
+## Features
+
+🚀 **Advanced Forecasting**
+- Hybrid AI Model (SARIMAX + XGBoost)
+- Real-time price predictions
+- Interactive time-range filtering
 - Responsive Recharts components
 
 🎨 **Premium Design**
