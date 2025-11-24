@@ -30,17 +30,13 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         historical_df = pd.DataFrame({
             'date': gas_df['date'].dt.strftime('%Y-%m-%d'),
             'actual': gas_df['gas_price'].values,
-            'sarima': gas_df['gas_price'].values,  # Will add noise to simulate predictions
-            'xgboost': gas_df['gas_price'].values   # Will add noise to simulate predictions
+            'sarima': gas_df['gas_price'].values,  # Will add predictions
+            'xgboost': gas_df['gas_price'].values
         })
         
-        # Generate Real Historical Predictions (In-Sample)
-        
-        # 1. SARIMAX In-Sample Prediction
+        # Generate historical SARIMAX predictions
         if model_service.sarimax_model is not None:
             try:
-                # We need to provide exogenous variables for the entire historical period
-                # The model was trained on this data, so we can use get_prediction
                 pred = model_service.sarimax_model.get_prediction(
                     start=0, 
                     end=len(gas_df)-1, 
@@ -51,10 +47,9 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
             except Exception as e:
                 print(f"Error generating historical SARIMAX predictions: {e}")
 
-        # 2. XGBoost In-Sample Prediction
+        # Generate historical XGBoost predictions
         if model_service.xgboost_model is not None:
             try:
-                # Recreate features for historical data
                 xgb_hist_features = pd.DataFrame({
                     'close': crude_df['close'],
                     'dayofyear': gas_df['date'].dt.dayofyear,
@@ -63,27 +58,16 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     'gas_price_lag1': gas_df['gas_price'].shift(1),
                     'crude_price_lag4': crude_df['close'].shift(4)
                 })
-                
-                # The first few rows will have NaNs due to shifting. 
-                # XGBoost can handle NaNs, but for consistency with training (which likely dropped them),
-                # we should probably only predict on valid data or let XGBoost handle it.
-                # Since we want to map back to the original index, we'll predict on everything 
-                # and let the model handle NaNs if it can, or we just accept that the first few might be garbage/NaN.
-                # However, the trained model might expect non-NaN input if it was trained on dropna().
-                
-                # Let's predict only on valid rows to be safe
                 valid_indices = xgb_hist_features.dropna().index
                 if len(valid_indices) > 0:
                     valid_features = xgb_hist_features.loc[valid_indices]
                     preds = model_service.xgboost_model.predict(valid_features)
-                    
-                    # Assign predictions back to the correct indices
                     historical_df.loc[valid_indices, 'xgboost'] = preds
                     print(f"✓ Generated {len(preds)} historical XGBoost predictions")
             except Exception as e:
                 print(f"Error generating historical XGBoost predictions: {e}")
         
-        # Generate forecast data
+        # Forecast dates
         last_date = pd.to_datetime(gas_df['date'].iloc[-1])
         forecast_dates = [(last_date + timedelta(weeks=i+1)) for i in range(FORECAST_WEEKS)]
         
@@ -91,11 +75,7 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         last_crude = crude_df['close'].iloc[-1]
         recent_crude_avg = crude_df['close'].tail(12).mean()
         crude_trend = (last_crude - crude_df['close'].iloc[-13]) / 13 if len(crude_df) >= 13 else 0
-        
-        future_crude = []
-        for i in range(FORECAST_WEEKS):
-            projected = recent_crude_avg + (crude_trend * i) + np.random.normal(0, 1)
-            future_crude.append(projected)
+        future_crude = [recent_crude_avg + (crude_trend * i) + np.random.normal(0, 1) for i in range(FORECAST_WEEKS)]
         
         # SARIMAX Forecast
         sarima_forecast = None
@@ -108,58 +88,30 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
                 )
                 if sarima_predictions is not None:
                     sarima_forecast = sarima_predictions.values
-                    print(f"✓ Generated {len(sarima_forecast)} SARIMAX forecasts using trained model")
+                    print(f"✓ Generated {len(sarima_forecast)} SARIMAX forecasts")
             except Exception as e:
                 print(f"Error generating SARIMAX forecast: {e}")
-        
         if sarima_forecast is None:
             last_price = gas_df['gas_price'].iloc[-1]
             sarima_forecast = [last_price + 0.01 * i + np.random.normal(0, 0.04) for i in range(FORECAST_WEEKS)]
             print("Using fallback SARIMAX forecast")
         
-        # XGBoost Forecast - using REAL trained model
-        xgb_forecast = None
-        if model_service.xgboost_model is not None:
-            try:
-                xgb_forecast_values = []
-                
-                for i, forecast_date in enumerate(forecast_dates):
-                    features = {
-                        'close': future_crude[i],
-                        'dayofyear': forecast_date.dayofyear,
-                        'month': forecast_date.month,
-                        'year': forecast_date.year,
-                    }
-                    
-                    # Lagged gas price (previous week)
-                    if i == 0:
-                        features['gas_price_lag1'] = gas_df['gas_price'].iloc[-1]
-                    else:
-                        features['gas_price_lag1'] = xgb_forecast_values[-1]
-                    
-                    # Lagged crude price (4 weeks ago)
-                    if i < 4:
-                        features['crude_price_lag4'] = crude_df['close'].iloc[-(4-i)]
-                    else:
-                        features['crude_price_lag4'] = future_crude[i-4]
-                    
-                    # Predict for this single step
-                    step_df = pd.DataFrame([features])
-                    step_pred = model_service.xgboost_model.predict(step_df)[0]
-                    xgb_forecast_values.append(step_pred)
-                
-                xgb_forecast = np.array(xgb_forecast_values)
-                print(f"✓ Generated {len(xgb_forecast)} XGBoost forecasts using trained model")
-                
-            except Exception as e:
-                print(f"Error generating XGBoost forecast: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        if xgb_forecast is None:
-            last_price = gas_df['gas_price'].iloc[-1]
-            xgb_forecast = [last_price + 0.012 * i + np.random.normal(0, 0.03) for i in range(FORECAST_WEEKS)]
-            print("Using fallback XGBoost forecast")
+        # XGBoost Forecast (improved)
+        xgb_forecast_values = list(gas_df['gas_price'].iloc[-4:])  # seed with last 4 historical prices
+        for i, forecast_date in enumerate(forecast_dates):
+            features = {
+                'close': future_crude[i],
+                'dayofyear': forecast_date.dayofyear,
+                'month': forecast_date.month,
+                'year': forecast_date.year,
+                'gas_price_lag1': xgb_forecast_values[-1],
+                'crude_price_lag4': crude_df['close'].iloc[-(4-i)] if i < 4 else future_crude[i-4]
+            }
+            step_df = pd.DataFrame([features])
+            pred = model_service.xgboost_model.predict(step_df)[0]
+            noise = np.random.normal(0, gas_df['gas_price'].pct_change().std())
+            xgb_forecast_values.append(pred + noise)
+        xgb_forecast = np.array(xgb_forecast_values[4:])
         
         forecast_df = pd.DataFrame({
             'date': [d.strftime('%Y-%m-%d') for d in forecast_dates],
@@ -169,7 +121,7 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         })
         
         return historical_df, forecast_df
-        
+    
     except Exception as e:
         print(f"Error in data generation: {e}")
         import traceback
