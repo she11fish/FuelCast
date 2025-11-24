@@ -34,11 +34,54 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
             'xgboost': gas_df['gas_price'].values   # Will add noise to simulate predictions
         })
         
-        # Add noise to simulate historical predictions (actual predictions would require refitting)
+        # Generate Real Historical Predictions (In-Sample)
+        
+        # 1. SARIMAX In-Sample Prediction
         if model_service.sarimax_model is not None:
-            historical_df['sarima'] = historical_df['actual'] + np.random.normal(0, 0.03, len(historical_df))
+            try:
+                # We need to provide exogenous variables for the entire historical period
+                # The model was trained on this data, so we can use get_prediction
+                pred = model_service.sarimax_model.get_prediction(
+                    start=0, 
+                    end=len(gas_df)-1, 
+                    exog=crude_df[['close']]
+                )
+                historical_df['sarima'] = pred.predicted_mean.values
+                print(f"✓ Generated {len(historical_df)} historical SARIMAX predictions")
+            except Exception as e:
+                print(f"Error generating historical SARIMAX predictions: {e}")
+
+        # 2. XGBoost In-Sample Prediction
         if model_service.xgboost_model is not None:
-            historical_df['xgboost'] = historical_df['actual'] + np.random.normal(0, 0.02, len(historical_df))
+            try:
+                # Recreate features for historical data
+                xgb_hist_features = pd.DataFrame({
+                    'close': crude_df['close'],
+                    'dayofyear': gas_df['date'].dt.dayofyear,
+                    'month': gas_df['date'].dt.month,
+                    'year': gas_df['date'].dt.year,
+                    'gas_price_lag1': gas_df['gas_price'].shift(1),
+                    'crude_price_lag4': crude_df['close'].shift(4)
+                })
+                
+                # The first few rows will have NaNs due to shifting. 
+                # XGBoost can handle NaNs, but for consistency with training (which likely dropped them),
+                # we should probably only predict on valid data or let XGBoost handle it.
+                # Since we want to map back to the original index, we'll predict on everything 
+                # and let the model handle NaNs if it can, or we just accept that the first few might be garbage/NaN.
+                # However, the trained model might expect non-NaN input if it was trained on dropna().
+                
+                # Let's predict only on valid rows to be safe
+                valid_indices = xgb_hist_features.dropna().index
+                if len(valid_indices) > 0:
+                    valid_features = xgb_hist_features.loc[valid_indices]
+                    preds = model_service.xgboost_model.predict(valid_features)
+                    
+                    # Assign predictions back to the correct indices
+                    historical_df.loc[valid_indices, 'xgboost'] = preds
+                    print(f"✓ Generated {len(preds)} historical XGBoost predictions")
+            except Exception as e:
+                print(f"Error generating historical XGBoost predictions: {e}")
         
         # Generate forecast data
         last_date = pd.to_datetime(gas_df['date'].iloc[-1])
@@ -78,7 +121,7 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         xgb_forecast = None
         if model_service.xgboost_model is not None:
             try:
-                xgb_features = []
+                xgb_forecast_values = []
                 
                 for i, forecast_date in enumerate(forecast_dates):
                     features = {
@@ -92,7 +135,7 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     if i == 0:
                         features['gas_price_lag1'] = gas_df['gas_price'].iloc[-1]
                     else:
-                        features['gas_price_lag1'] = xgb_forecast[i-1]
+                        features['gas_price_lag1'] = xgb_forecast_values[-1]
                     
                     # Lagged crude price (4 weeks ago)
                     if i < 4:
@@ -100,11 +143,12 @@ def generate_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     else:
                         features['crude_price_lag4'] = future_crude[i-4]
                     
-                    xgb_features.append(features)
+                    # Predict for this single step
+                    step_df = pd.DataFrame([features])
+                    step_pred = model_service.xgboost_model.predict(step_df)[0]
+                    xgb_forecast_values.append(step_pred)
                 
-                # Create DataFrame and predict
-                xgb_df = pd.DataFrame(xgb_features)
-                xgb_forecast = model_service.xgboost_model.predict(xgb_df)
+                xgb_forecast = np.array(xgb_forecast_values)
                 print(f"✓ Generated {len(xgb_forecast)} XGBoost forecasts using trained model")
                 
             except Exception as e:
